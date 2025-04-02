@@ -4,7 +4,7 @@ locals {
   region = "ap-northeast-1"
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
   vpc_cidr = "10.0.0.0/16"
-  cluster_version = "1.29"
+  cluster_version = "1.32"
   tags = {
     Example    = local.name
     GithubRepo = "terraform-aws-vpc"
@@ -24,11 +24,13 @@ data "aws_ami" "eks_default" {
 
 provider "aws" {
   region = local.region
+  profile = var.profile
 }
 
 data "aws_availability_zones" "available" {}
 
 module "vpc" {
+  version = "5.18.1"
   source = "terraform-aws-modules/vpc/aws"
   name = "${local.name}-vpc"
   cidr = local.vpc_cidr
@@ -82,7 +84,7 @@ EOF
 
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
-  version = "20.8.5"
+  version = "20.24.0"
 
   create = true
 
@@ -125,6 +127,14 @@ module "eks" {
       cidr_blocks      = ["0.0.0.0/0"]
       ipv6_cidr_blocks = ["::/0"]
     }
+    ingress_cluster_all = {
+      description                   = "Cluster to node all ports/protocols"
+      protocol                      = "-1"
+      from_port                     = 0
+      to_port                       = 0
+      type                          = "ingress"
+      source_cluster_security_group = true
+    }
   }
 
   node_security_group_use_name_prefix = false
@@ -136,7 +146,7 @@ module "eks" {
   subnet_ids = module.vpc.private_subnets
 
   cluster_name    = local.name
-  cluster_version = "1.29"
+  cluster_version = local.cluster_version
 
   # cluster_endpoint_private_access        = true
   cluster_endpoint_public_access         = true
@@ -174,6 +184,9 @@ module "eks" {
             memory = "256M"
           }
         }
+        podLabels = {
+          runtime = "fargate"
+        }
       })
     }
     kube-proxy = {}
@@ -195,7 +208,12 @@ module "eks" {
   fargate_profiles = {
     kube-system = {
       selectors = [
-        { namespace = "kube-system" }
+        {
+          namespace = "kube-system"
+          labels = {
+            runtime = "fargate"
+          }
+        }
       ]
 
       /**
@@ -208,29 +226,17 @@ module "eks" {
   }
 }
 
-
-data "aws_eks_cluster_auth" "eks" {
-  depends_on = [module.eks.cluster_name]
-  name = module.eks.cluster_name
-}
-
-data "aws_eks_cluster" "eks" {
-  depends_on = [module.eks.cluster_name]
-  name = "${module.eks.cluster_name}"
-}
-
 ######################
 # Kubernetes provider
 ######################
 provider "kubernetes" {
   host                   = module.eks.cluster_endpoint
   cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
-  token                  = data.aws_eks_cluster_auth.eks.token
   exec {
     api_version = "client.authentication.k8s.io/v1"
     command     = "aws"
     # This requires the awscli to be installed locally where Terraform is executed
-    args = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+    args = ["eks", "get-token", "--profile", "${var.profile}", "--cluster-name", module.eks.cluster_name]
   }
 }
 
@@ -239,13 +245,13 @@ provider "helm" {
   kubernetes {
     # config_path = "~/.kube/config"
     
-    host                   = data.aws_eks_cluster.eks.endpoint
-    cluster_ca_certificate = base64decode(data.aws_eks_cluster.eks.certificate_authority[0].data)
+    host                   = module.eks.cluster_endpoint
+    cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
     exec {
       api_version = "client.authentication.k8s.io/v1"
       command     = "aws"
       # This requires the awscli to be installed locally where Terraform is executed
-      args = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+      args = ["eks", "get-token",  "--profile", "${var.profile}", "--cluster-name", module.eks.cluster_name]
     }
   }
 }
@@ -261,7 +267,7 @@ provider "kubectl" {
     api_version = "client.authentication.k8s.io/v1beta1"
     command     = "aws"
     # This requires the awscli to be installed locally where Terraform is executed
-    args = ["eks", "get-token", "--cluster-name", module.eks.cluster_name]
+    args = ["eks", "get-token",  "--profile", "${var.profile}", "--cluster-name", module.eks.cluster_name]
   }
 }
 
@@ -275,6 +281,15 @@ resource "aws_security_group_rule" "cluster_primary_security_group_from_node_sec
   protocol                 = "all"
   source_security_group_id = module.eks.node_security_group_id
 }
+resource "aws_security_group_rule" "node_security_group_from_cluster_primary_security_group" {
+  description              = "Allow all traffic from cluster primary security group to node security group"
+  to_port                  = -1
+  from_port                = -1
+  type                     = "ingress"
+  security_group_id        = module.eks.node_security_group_id
+  protocol                 = "all"
+  source_security_group_id = module.eks.cluster_primary_security_group_id
+}
 
 ################################################################################
 # Karpenter
@@ -283,13 +298,17 @@ resource "aws_security_group_rule" "cluster_primary_security_group_from_node_sec
 module "karpenter" {
   source = "terraform-aws-modules/eks/aws//modules/karpenter"
 
+  version = "20.24.0"
+
+  enable_v1_permissions = true
+
   cluster_name = module.eks.cluster_name
 
   irsa_namespace_service_accounts = [
     "kube-system:karpenter"
   ]
 
-  node_iam_role_attach_cni_policy = false
+  node_iam_role_attach_cni_policy = true
 
   # EKS Fargate currently does not support Pod Identity
   enable_irsa            = true
@@ -307,23 +326,46 @@ module "karpenter" {
   tags = local.tags
 }
 
+resource "helm_release" "karpenter_crd" {
+  provider         = helm.default
+  namespace        = "kube-system"
+  create_namespace = false
+  name             = "karpenter-crd"
+  repository       = "oci://public.ecr.aws/karpenter"
+  chart            = "karpenter-crd"
+  version          = "1.2.1"
+  wait             = true
+  depends_on = [
+    module.karpenter,
+    module.eks.fargate_profiles,
+    module.eks.cluster_name,
+    module.eks.access_entries,
+    module.eks.access_policy_associations,
+  ]
+
+  values = [
+    <<-EOT
+    webhook:
+      enabled: true
+      serviceName: karpenter
+      port: 8443
+    EOT
+  ]
+}
+
 resource "helm_release" "karpenter" {
+  provider = helm.default
   namespace        = "kube-system"
   create_namespace = false
   name             = "karpenter"
   repository       = "oci://public.ecr.aws/karpenter"
-  #   repository_username = data.aws_ecrpublic_authorization_token.token.user_name
-  #   repository_password = data.aws_ecrpublic_authorization_token.token.password
   chart   = "karpenter"
-  version = "0.35.2"
+  version = "1.2.1"
+  skip_crds        = true
+  disable_webhooks = false
   wait    = false
   depends_on = [
-    module.karpenter,
-    module.eks.fargate_profiles,
-    data.aws_eks_cluster_auth.eks,
-    module.eks.cluster_name,
-    module.eks.access_entries,
-    module.eks.access_policy_associations,
+    helm_release.karpenter_crd,
   ]
 
   values = [
@@ -367,6 +409,8 @@ resource "helm_release" "karpenter" {
               operator: NotIn
               values:
               - karpenter
+    podLabels:
+      runtime: fargate
           
     EOT
   ]
@@ -374,16 +418,17 @@ resource "helm_release" "karpenter" {
 
 resource "kubectl_manifest" "karpenter_node_class" {
   provider   = kubectl.k8s
-  apply_only = true
+  apply_only = false
   yaml_body  = <<-YAML
-apiVersion: karpenter.k8s.aws/v1beta1
+apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
   name: default
 spec:
-  amiFamily: AL2
+  amiFamily: AL2023
   amiSelectorTerms:
-  - id: ${data.aws_ami.eks_default.id}
+  - alias: al2023@latest
+  # - id: ${data.aws_ami.eks_default.id}
   blockDeviceMappings:
   - deviceName: /dev/xvda
     ebs:
@@ -401,7 +446,7 @@ spec:
   instanceProfile: "${module.karpenter.instance_profile_name}"
   subnetSelectorTerms:
     - tags:
-        Name: "stp-vpc-pub-private-${local.region}*"
+        Name: "${local.name}-vpc-private-*"
   securityGroupSelectorTerms:
     - tags:
         Name: "${local.name}-eks-worker-sg"
@@ -419,9 +464,9 @@ spec:
 
 resource "kubectl_manifest" "karpenter_node_pool" {
   provider   = kubectl.k8s
-  apply_only = true
+  apply_only = false
   yaml_body  = <<-YAML
-apiVersion: karpenter.sh/v1beta1
+apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
   name: default
@@ -429,15 +474,21 @@ spec:
   limits:
     cpu: 1000
   disruption:
-    consolidationPolicy: WhenEmpty
+    budgets:
+    - nodes: 10%
+    - nodes: "0"
+      reasons:
+      - Drifted
+    consolidationPolicy: WhenEmptyOrUnderutilized
     consolidateAfter: 30s
   template:
     metadata:
       labels:
         app: default
     spec:
+      expireAfter: 2160h
       nodeClassRef:
-        apiVersion: karpenter.k8s.aws/v1beta1
+        group: karpenter.k8s.aws
         kind: EC2NodeClass
         name: default
       requirements:
@@ -451,11 +502,12 @@ spec:
           - linux
         - key: node.kubernetes.io/instance-type
           operator: In
-          values: t3.medium
+          values: 
+          - t3.medium
         - key: karpenter.sh/capacity-type
           operator: In
           values:
-          - "spot"
+          - spot
   YAML
 
   depends_on = [
@@ -541,13 +593,12 @@ resource "time_sleep" "wait_for_karpenter" {
 ###########
 # BluePrint Addons
 ##########
-module "eks_blueprints_addon" {
+module "eks_blueprints_addon_aws" {
   depends_on = [
     time_sleep.wait_for_karpenter,
     helm_release.karpenter,
     kubectl_manifest.karpenter_node_class,
     kubectl_manifest.karpenter_node_pool,
-    data.aws_eks_cluster_auth.eks,
     module.eks.cluster_name,
     module.eks.access_entries,
     module.eks.access_policy_associations,
@@ -556,18 +607,20 @@ module "eks_blueprints_addon" {
     helm = helm.default
   }
   source  = "aws-ia/eks-blueprints-addons/aws"
-  version = "1.16.2"
+  version = "1.19.0"
 
   cluster_name      = module.eks.cluster_name
   cluster_endpoint  = module.eks.cluster_endpoint
   cluster_version   = module.eks.cluster_version
   oidc_provider_arn = module.eks.oidc_provider_arn
 
+  observability_tag = null
+
   enable_aws_load_balancer_controller = true
   aws_load_balancer_controller = {
     create_namespace = false
     namespace        = "kube-public"
-    chart_version    = "1.7.2"
+    chart_version    = "1.11.0"
     wait             = true
     timeout          = 600
     values = [
@@ -576,8 +629,6 @@ module "eks_blueprints_addon" {
         featureGates:
           SubnetsClusterTagCheck: false
       clusterName: ${module.eks.cluster_name}
-      nodeSelector:
-        app: devops
       EOT
     ]
   }
@@ -588,17 +639,19 @@ module "eks_blueprints_addon" {
 */
 module "eks_blueprints_addon_other" {
   depends_on = [
-  module.eks_blueprints_addon.aws_load_balancer_controller, ]
+  module.eks_blueprints_addon_aws.aws_load_balancer_controller, ]
   providers = {
     helm = helm.default
   }
   source  = "aws-ia/eks-blueprints-addons/aws"
-  version = "1.16.2"
+  version = "1.19.0"
 
   cluster_name      = module.eks.cluster_name
   cluster_endpoint  = module.eks.cluster_endpoint
   cluster_version   = module.eks.cluster_version
   oidc_provider_arn = module.eks.oidc_provider_arn
+
+  observability_tag = null
 
   enable_metrics_server = true
   metrics_server = {
@@ -610,8 +663,6 @@ module "eks_blueprints_addon_other" {
       <<-EOT
       apiService:
         create: true
-      nodeSelector:
-        app: devops
       EOT
     ]
   }
@@ -658,7 +709,59 @@ module "eks_blueprints_addon_other" {
   }
 }
 
-
+resource "helm_release" "node_local_dns" {
+  namespace        = "kube-system"
+  create_namespace = false
+  name             = "node-local-dns"
+  repository       = "https://charts.deliveryhero.io"
+  chart            = "node-local-dns"
+  version          = "2.0.12"
+  wait             = false
+  provider         = helm.default
+  /**
+  * https://developer.hashicorp.com/terraform/language/functions/cidrhost
+  */
+  values = [
+    <<-EOT
+    fullnameOverride: "node-local-dns"
+    config:
+      dnsServer: ${cidrhost(module.eks.cluster_service_cidr, 10)}
+      dnsDomain: cluster.local
+      localDns: 169.254.20.25
+    dashboard:
+      enabled: false
+    prometheusScraping:
+      enabled: false
+    serviceMonitor:
+      enabled: false
+    podAnnotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9253"
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+          - matchExpressions:
+            - key: kubernetes.io/os
+              operator: In
+              values:
+              - linux
+            - key: kubernetes.io/arch
+              operator: In
+              values:
+              - amd64
+              - arm64
+            - key: eks.amazonaws.com/compute-type
+              operator: NotIn
+              values:
+              - fargate
+    EOT
+  ]
+  depends_on = [
+    kubectl_manifest.karpenter_node_pool,
+    module.eks_blueprints_addon_other,
+  ]
+}
 
 output "eks" {
   value = {
